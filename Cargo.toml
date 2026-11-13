@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/platform-win", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+switcheroo-core = { path = "crates/core" }
+switcheroo-platform-win = { path = "crates/platform-win" }
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+env_logger = "0.11"
+log = "0.4"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+strip = true
+
+# 发布用 profile：体积优先（16.9MB → 约 6.3MB）。
+# 单独定义是为了不影响 `cargo test --release`（panic=abort 与测试 harness 冲突）。
+[profile.dist]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"

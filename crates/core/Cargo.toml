@@ -1,0 +1,20 @@
+[package]
+name = "switcheroo-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Switcheroo 的纯逻辑内核：窗口模型、查询解析、匹配与排序，不依赖 UI 与操作系统 API"
+
+[dependencies]
+# US-045 拼音首字母检索：需要汉字 → 拼音的表，内置维护四万多字的读音与多音字数据不现实，
+# 因此引入 `pinyin`（MIT，无 unsafe，只依赖 std 与它自带的拼音数据表）。
+# 只开最小可用组合：
+#   plain     —— `Pinyin::first_letter()` 取每个汉字拼音的首字母（文 → w、件 → j）；
+#   heteronym —— `ToPinyinMulti` 拿到多音字的全部读音，「乐」同时有 lè / yuè，
+#                没有这一项就凑不出 `yy` 命中「音乐」。
+# 不开 compat / with_tone* / with_tone_num*，避免编译用不到的声调表。
+pinyin = { version = "0.10", default-features = false, features = ["plain", "heteronym"] }
+
+[lints]
+workspace = true

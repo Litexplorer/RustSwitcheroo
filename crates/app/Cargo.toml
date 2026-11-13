@@ -1,0 +1,21 @@
+[package]
+name = "switcheroo-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Switcheroo 的 egui 浮层界面"
+
+[[bin]]
+name = "switcheroo"
+path = "src/main.rs"
+
+[dependencies]
+switcheroo-core.workspace = true
+switcheroo-platform-win.workspace = true
+eframe.workspace = true
+env_logger.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

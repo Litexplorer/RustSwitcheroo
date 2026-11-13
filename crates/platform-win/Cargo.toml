@@ -1,0 +1,44 @@
+[package]
+name = "switcheroo-platform-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Switcheroo 的 Windows 平台层：窗口枚举、图标、全局热键、键盘钩子、托盘与开机自启"
+
+[dependencies]
+switcheroo-core.workspace = true
+log.workspace = true
+
+# US-034/US-035：单实例互斥量与全局热键需要直接调用 Win32。
+# 只开用到的 feature：Win32_Security 是 CreateMutexW 签名的硬性依赖（SECURITY_ATTRIBUTES）。
+# US-036 的窗口枚举复用了同一批 feature（Foundation / Threading / WindowsAndMessaging），
+# 不需要再补。
+# US-044 的图标解码额外需要两个 feature：
+#   Win32_Graphics_Gdi —— GetDIBits / GetObjectW / DeleteObject / CreateCompatibleDC 与
+#                         BITMAP、BITMAPINFO 结构体都定义在 Gdi 下（ICONINFO 的字段也依赖它）；
+#   Win32_UI_Shell    —— ExtractIconExW（可执行文件图标）与 SHGetFileInfoW 定义在 Shell 下。
+# US-044 的 exe 图标兜底用了 SHGetFileInfoW，它的第二个参数类型
+# FILE_FLAGS_AND_ATTRIBUTES 定义在 Storage::FileSystem 下，因此还要开：
+#   Win32_Storage_FileSystem —— FILE_FLAGS_AND_ATTRIBUTES（SHGetFileInfoW 的参数类型）。
+# US-048 的托盘与开机自启再补两个 feature：
+#   Win32_System_Registry      —— RegOpenKeyExW / RegSetValueExW / RegQueryValueExW /
+#                                 RegDeleteValueW / RegCloseKey 与 HKEY、REG_SZ 都在 Registry 下；
+#   Win32_System_LibraryLoader —— GetModuleHandleW 定义在 LibraryLoader 下，注册托盘窗口类
+#                                 要用它取本进程的 HMODULE（WNDCLASSW.hInstance 必填）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true
