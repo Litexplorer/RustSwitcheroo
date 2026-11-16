@@ -1,0 +1,52 @@
+[package]
+name = "switcheroo-winui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Switcheroo 的 Windows 原生浮层：Win32 + Direct2D / DirectWrite 绘制（S1 → S6）"
+
+[[bin]]
+name = "switcheroo-win"
+path = "src/main.rs"
+
+[dependencies]
+switcheroo-core.workspace = true
+switcheroo-platform-win.workspace = true
+# 日志只依赖 log 门面：env_logger 为了过滤器与格式化背了一堆机器码，dist 里能占到几十 KB，
+# 这里换成 src/logger.rs 里几十行的 stderr logger（级别读 RUST_LOG 或默认 info）。
+log.workspace = true
+
+# 只开真正用到的 feature：
+#   Win32_Foundation               —— HWND / WPARAM / LRESULT / POINT / RECT / SIZE / GetLastError；
+#   Win32_Graphics_Gdi             —— HDC、CreateCompatibleDC、CreateDIBSection、SelectObject、
+#                                     DeleteObject / DeleteDC、BLENDFUNCTION、MONITORINFO
+#                                     （MonitorFromPoint / GetMonitorInfoW 在 windows-sys 里挂在 Gdi 下）；
+#   Win32_System_Com               —— CoInitializeEx / CoUninitialize（Direct2D 与 DWrite 都要求 COM 已初始化）；
+#   Win32_System_LibraryLoader     —— GetModuleHandleW 取 HMODULE 填 WNDCLASSW.hInstance；
+#   Win32_System_Threading         —— AttachThreadInput（抢前台时临时挂接前台线程的输入队列）；
+#   Win32_UI_WindowsAndMessaging   —— 窗口类/窗口、消息循环、ShowWindow、SetForegroundWindow、UpdateLayeredWindow、
+#                                     GetCursorPos、SetWindowLongPtrW、BringWindowToTop、GetWindowThreadProcessId 等；
+#   Win32_UI_Input_KeyboardAndMouse —— GetKeyState（Ctrl+Q / Shift 判定）、SetFocus、SetActiveWindow。
+#
+# S3 用到的 EDIT 消息（EM_SETCUEBANNER / EM_SETSEL）在 windows-sys 里属于未开启的
+# Win32_UI_Controls feature，所以 src/edit.rs 自己按 WinUser.h 定义了这两个常量；
+# 拿到的都是纯数值，与 feature 是否开启无关。
+#
+# 注意：windows-sys 不导出 Direct2D / DirectWrite（这两个是 COM 接口，只有 windows crate 有绑定），
+# 所以 Win32_Graphics_Direct2D / Win32_Graphics_DirectWrite 这两个 feature 根本不存在；
+# 它们由 src/render.rs 里的 extern 声明 + 手写 vtable 调用补上，链接 d2d1.dll / dwrite.dll。
+# Win32_Graphics_Dwm 当前路线（WS_EX_LAYERED + UpdateLayeredWindow）用不到，故不开启。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

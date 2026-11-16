@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/platform-win", "crates/app"]
+members = ["crates/core", "crates/platform-win", "crates/app", "crates/winui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -37,3 +37,13 @@ opt-level = "s"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# 只给原生浮层这一层按包覆盖：开启体积优先的 "z" 档（比 "s" 更偏向不内联 / 不展开循环），
+# egui 版的 dist 配置（上面那段）保持不变。
+#
+# 这里必须显式写上 `strip = "symbols"`：一旦某个包有了自己的 profile 覆盖，上面
+# `[profile.release]` 里的 `strip = true` 就不再作用到这个包的最终链接上，
+# 产物会多出约 120 KB 的 COFF 符号表（真机实测 916,720 B → 795,648 B）。
+[profile.dist.package.switcheroo-winui]
+opt-level = "z"
+strip = "symbols"
