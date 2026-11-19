@@ -4,8 +4,9 @@
 //! 核心流程：[`SearchEdit::create`] 在浮层窗口里建一个 `WS_CHILD` 的 EDIT → 用
 //! `SPI_GETNONCLIENTMETRICS` 的 `lfMessageFont` 按 DPI 缩放后 `CreateFontIndirectW` 建字体并
 //! `WM_SETFONT` → 用 `GWLP_WNDPROC` + `CallWindowProcW` 子类化，把导航键转发给父窗口
-//! （`WM_APP + 2`），其余消息一律交回 EDIT 自己的过程，中文 IME 的 `WM_IME_*` / `WM_CHAR`
-//! 因此完全不受影响。
+//! （`WM_APP + 2`），并吞掉快捷键自己产生的字符消息（`WM_SYSCHAR` 与快捷键控制码的
+//! `WM_CHAR`，见 [`edit_proc`] 与 [`is_shortcut_char`]），其余消息一律交回 EDIT 自己的过程，
+//! 中文 IME 的 `WM_IME_*` 与正常输入的 `WM_CHAR` 因此完全不受影响。
 //!
 //! 占位文案（S9）为什么不再用 `EM_SETCUEBANNER`：那条消息的 cue 文字颜色跟随系统视觉样式，
 //! `WM_CTLCOLOREDIT` 改不动它，深色卡片上会变成「深灰字压深色底」看不清。所以这里只负责
@@ -26,14 +27,15 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM
 use windows_sys::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HFONT, LOGFONTW};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_MENU, VK_RETURN, VK_TAB, VK_UP,
+    GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F1, VK_MENU, VK_RETURN, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetParent,
     GetWindowTextLengthW, GetWindowTextW, MoveWindow, SendMessageW, SetWindowLongPtrW,
     SetWindowTextW, ShowWindow, SystemParametersInfoW, ES_AUTOHSCROLL, GWLP_WNDPROC,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW, WM_APP, WM_KEYDOWN, WM_KEYUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_SETFONT, WM_SYSKEYDOWN, WNDPROC, WS_CHILD, WS_VISIBLE,
+    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW, WM_APP, WM_CHAR, WM_KEYDOWN,
+    WM_KEYUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_SETFONT, WM_SYSCHAR, WM_SYSKEYDOWN, WNDPROC,
+    WS_CHILD, WS_VISIBLE,
 };
 
 use crate::layout;
@@ -327,16 +329,25 @@ fn create_message_font(scale: f32) -> Result<HFONT, String> {
 /// 输入框的窗口过程（子类化后接管所有发往 EDIT 的消息）。
 ///
 /// 参数：`hwnd` EDIT 句柄；`msg` 消息号；`wparam` / `lparam` 消息参数。
-/// 核心流程：只挑五种情况自己处理——`WM_KEYDOWN` 里的方向键 / Tab / 回车 / Esc（外加
+/// 核心流程：只挑六种情况自己处理——`WM_KEYDOWN` 里的方向键 / Tab / 回车 / Esc（外加
 /// `Ctrl+Q`、`Ctrl+W`、`Alt+X`、`Ctrl+T`、`Ctrl+,`）、`WM_KEYUP` 的回车（切换只在抬起时执行）、
-/// `WM_MOUSEWHEEL` 的滚轮、`WM_MOUSEMOVE`（清悬停行）与 IME 组字开始 / 结束（父窗口据此暂停自绘
-/// 占位文案）——统一用 `SendMessageW(GetParent(hwnd), 自定义消息, ...)` 转给父窗口（按下走
-/// [`WM_EDIT_KEY`]、抬起走 [`WM_EDIT_KEYUP`]、滚轮走 [`WM_EDIT_WHEEL`]），并 `return 0` 阻止
-/// EDIT 自己再处理一遍；其余消息（含 `WM_CHAR`、`WM_IME_*`、`WM_PASTE` 等）原样交回 EDIT
-/// 的默认过程，中文输入法与编辑行为因此完全不受影响。
+/// `WM_MOUSEWHEEL` 的滚轮、`WM_MOUSEMOVE`（清悬停行）、IME 组字开始 / 结束（父窗口据此暂停自绘
+/// 占位文案）与快捷键遗留的字符消息（`WM_SYSCHAR`、[`is_shortcut_char`]）——前五类统一用
+/// `SendMessageW(GetParent(hwnd), 自定义消息, ...)` 转给父窗口（按下走 [`WM_EDIT_KEY`]、抬起走
+/// [`WM_EDIT_KEYUP`]、滚轮走 [`WM_EDIT_WHEEL`]），并 `return 0` 阻止 EDIT 自己再处理一遍；
+/// 其余消息（含正常输入的 `WM_CHAR`、`WM_IME_*`、`WM_PASTE` 等）原样交回 EDIT 的默认过程，
+/// 中文输入法与编辑行为因此完全不受影响。
 ///
 /// 为什么要拦滚轮：单行 EDIT 会把 `WM_MOUSEWHEEL` 当成自己的横向滚动吃掉，不转发的话
 /// 焦点在输入框里时列表就永远滚不动。
+///
+/// 为什么要吞字符消息：`TranslateMessage` 是在 `DispatchMessageW` **之前**就把按键翻成
+/// 字符消息投进队列的（见 `app::run` 的循环），所以父窗口 `return 0` 消费掉按键消息拦不住
+/// 随后到达的字符消息。`Ctrl+字母` 翻出来的是控制码 `WM_CHAR`，EDIT 会静默丢弃（不响）；
+/// `Alt+字母` 翻出来的是 `WM_SYSCHAR`，EDIT 不处理、交回默认过程后 `DefWindowProcW` 会去查
+/// 菜单助记符，查不到就播放系统默认提示音——真机上就是「Alt+X 关闭窗口时咚一声」。
+/// 同理 `Esc`：`TranslateMessage` 也会为它入队 `WM_CHAR 0x1B`，EDIT 不认这个字符，交回默认
+/// 过程照样会响，所以 [`is_shortcut_char`] 把 0x1B 一并列进去。
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -345,6 +356,12 @@ unsafe extern "system" fn edit_proc(
 ) -> LRESULT {
     let vk = wparam as u32;
     match msg {
+        // 快捷键遗留的字符消息：Alt+字母是 WM_SYSCHAR（wparam 是字符码），交回默认过程会被
+        // DefWindowProcW 当成菜单助记符去查，查不到就响系统默认提示音，所以直接吞掉。
+        WM_SYSCHAR => return 0,
+        // Ctrl+字母的控制码与 Esc 的 0x1B。只吞快捷键自己产生的那几个（[`is_shortcut_char`]），
+        // 不吞所有 `c < 0x20`：EDIT 的 Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+Z 与退格也靠 WM_CHAR 驱动。
+        WM_CHAR if is_shortcut_char(vk) => return 0,
         // Alt 组合键走 WM_SYSKEYDOWN（Alt+X 就是这一类），所以两个键盘消息都要看。
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             if is_forwarded_key(vk) {
@@ -385,6 +402,15 @@ unsafe extern "system" fn edit_proc(
     unsafe { CallWindowProcW(previous, hwnd, msg, wparam, lparam) }
 }
 
+/// 参数：`c` `WM_CHAR` 的字符码（就是它的 `wparam`）
+/// 核心流程：判断这个字符码是不是本项目快捷键产生的——`Ctrl+字母` 按「字母码 & 0x1F」折算，
+/// 于是 `Ctrl+Q` 0x11、`Ctrl+T` 0x14、`Ctrl+W` 0x17，`Ctrl+,` 是 `0x2C & 0x1F` = 0x0C；
+/// 再加上 `Esc` 的 0x1B（它的按键已经转给父窗口收起浮层）。这几个键的**按键**消息已经在父窗口
+/// 被消费，随之而来的**字符**消息必须一起吞掉，否则会落到默认过程响系统默认提示音。
+fn is_shortcut_char(c: u32) -> bool {
+    matches!(c, 0x11 | 0x14 | 0x17 | 0x0C | 0x1B)
+}
+
 /// 参数：`vk` 虚拟键码
 /// 核心流程：判断这个键要不要交给父窗口——方向键 / Tab / 回车 / Esc 是列表导航；
 /// `Ctrl+Q` 退出、`Ctrl+W` 关闭选中窗口、`Alt+X` 关闭选中窗口、`Ctrl+T` 切换明暗、`Ctrl+,`
@@ -418,6 +444,9 @@ fn is_forwarded_key(vk: u32) -> bool {
         vk if vk == u32::from(b'Q') || vk == u32::from(b'W') => ctrl_down,
         // Alt+X 关闭选中窗口（与 Ctrl+W 等价）。
         vk if vk == u32::from(b'X') => alt_down,
+        // F1：系统在按键**按下**时就会为 F1 发 `WM_HELP`，浮层没有任何帮助内容，
+        // `DefWindowProcW` 查不到就响一声。EDIT 默认过程本来也只拿 F1 开帮助，吞掉不影响输入。
+        vk if vk == VK_F1 as u32 => true,
         _ => false,
     }
 }
@@ -441,4 +470,28 @@ fn forward_to_parent(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
 /// 核心流程：转成 NUL 结尾的 UTF-16 缓冲，供 Win32 的 `*W` API 使用。
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 只吞快捷键自己产生的字符：Ctrl+Q / Ctrl+T / Ctrl+W / Ctrl+, / Esc 必须在列；
+    /// EDIT 自带的 Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+Z、退格、回车与普通字符必须不在列——
+    /// 吞错了就等于把复制粘贴与正常输入一起废掉。
+    #[test]
+    fn only_shortcut_control_chars_are_swallowed() {
+        for shortcut in [0x11, 0x14, 0x17, 0x0C, 0x1B] {
+            assert!(
+                is_shortcut_char(shortcut),
+                "0x{shortcut:02X} 是快捷键控制码"
+            );
+        }
+        for edit_key in [0x03, 0x16, 0x18, 0x1A, 0x08, 0x0D, 0x09, 0x7F] {
+            assert!(!is_shortcut_char(edit_key), "0x{edit_key:02X} 要留给 EDIT");
+        }
+        for printable in [b'a' as u32, b'W' as u32, b',' as u32, 0x4E2D] {
+            assert!(!is_shortcut_char(printable), "0x{printable:02X} 是正常输入");
+        }
+    }
 }

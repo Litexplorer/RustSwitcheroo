@@ -129,6 +129,9 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const VK_COMMA: u16 = 0xBC;
 /// Ctrl+T 里的 `T`（见 [`VK_Q`] 的说明）。
 const VK_T: u16 = 0x54;
+/// `WM_HELP`（0x0053）：系统在按下 `F1` 时发给焦点窗口。windows-sys 0.61 把它放在未开启的
+/// `Win32_UI_Shell` feature 下，这里按 WinUser.h 的取值自定义；本 crate 只拿它当消息号比较。
+const WM_HELP: u32 = 0x0053;
 /// 「刚显示就失去激活」的保护期：`show()` 里的 `ShowWindow` / `SetForegroundWindow` / 焦点交接
 /// 会连带引发若干次瞬时激活切换（系统还会给上一个前台窗口补发 `WM_ACTIVATE`），不设保护期
 /// 会出现「热键一按、浮层刚亮就自己收起来」。300ms 足够覆盖这些瞬时消息，又短到不影响
@@ -810,15 +813,22 @@ impl App {
     }
 
     /// 参数：`virtual_key` 抬起的虚拟键码
-    /// 核心流程：面板打开时抬起一律不处理（否则回车抬起会把列表里的窗口切走）→ 否则只处理
-    /// 回车：切换动作放在抬起时执行，自动重复不会把同一个窗口切好几次；其它键抬起一律忽略。
+    /// 核心流程：面板打开时抬起一律不处理（否则回车抬起会把列表里的窗口切走）→ 回车：
+    /// 切换动作放在抬起时执行，自动重复不会把同一个窗口切好几次 → `Esc`：`WM_KEYDOWN`
+    /// 那一步已经收起浮层，这里只负责把这条消息消费掉；其它键抬起一律忽略。
     /// 返回 `true` 表示已消费。
     fn on_key_up(&mut self, virtual_key: u32) -> bool {
-        if self.panel.is_some() || virtual_key as u16 != VK_RETURN {
+        if self.panel.is_some() {
             return false;
         }
-        self.commit_selected();
-        true
+        match virtual_key as u16 {
+            VK_RETURN => {
+                self.commit_selected();
+                true
+            }
+            VK_ESCAPE => true,
+            _ => false,
+        }
     }
 
     /// 参数：`virtual_key` 面板打开时按下的虚拟键码（父窗口焦点下的 `WM_KEYDOWN` /
@@ -2257,7 +2267,8 @@ fn apply_window_icon(hwnd: HWND) {
 /// `WM_TIMER`（关闭轮询定时器）复查关闭中的窗口 → `WM_ACTIVATE` 的 `WA_INACTIVE`（点到别的窗口）
 /// 自动收起浮层 → `WM_SETFOCUS`（顶层窗口重新拿到焦点时把焦点
 /// 交回输入框）→ `WM_KEYDOWN` / `WM_KEYUP`（焦点在父窗口时）处理导航与快捷键（快捷键与输入框
-/// 转发路径共用 [`App::handle_hotkey`]）→ `WM_DESTROY` 释放全部资源并投递 `WM_QUIT`；其余交给
+/// 转发路径共用 [`App::handle_hotkey`]）→ `WM_CHAR` / `WM_SYSCHAR` 一律吞掉（本窗口没有任何文本
+/// 输入，交回默认过程会响系统默认提示音）→ `WM_DESTROY` 释放全部资源并投递 `WM_QUIT`；其余交给
 /// `DefWindowProcW`。
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY: 只读本窗口的 GWLP_USERDATA 槽；窗口创建完成后由 run 写入 App 指针，
@@ -2401,20 +2412,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             0
         }
-        // 面板打开时焦点在父窗口上（输入框被隐藏），TranslateMessage 仍会把按键翻成 WM_CHAR /
-        // WM_SYSCHAR。面板里没有任何文本输入，这些字符消息交回默认过程只会「叮」一声，所以
-        // 直接吞掉。
-        WM_CHAR | WM_SYSCHAR => {
-            if !app.is_null() {
-                // SAFETY: app 指向 run 里那个仍然存活的 Box<App>；这里只读 panel 字段，判断
-                // 面板是否打开，不碰任何句柄。
-                if unsafe { (*app).panel.is_some() } {
-                    return 0;
-                }
-            }
-            // SAFETY: 面板没开时交回默认过程，参数均来自系统。
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
+        // TranslateMessage 会把按键翻成 WM_CHAR / WM_SYSCHAR 投给本窗口——面板打开时焦点在父
+        // 窗口上，就是这一类；输入框隐藏 / 焦点交接的短暂间隙里也可能落在这里。本窗口自己没有任何
+        // 文本输入（文字全部进 EDIT 子窗口），这些字符消息没有消费者，交回默认过程只会响一声
+        // 系统默认提示音（Alt+字母查不到菜单助记符时的「咚」），所以一律吞掉。
+        WM_CHAR | WM_SYSCHAR => 0,
         WM_TIMER if wparam == POLL_TIMER_ID => {
             if !app.is_null() {
                 // SAFETY: 同 WM_TOGGLE；定时器消息只在窗口线程派发，轮询里会读写列表与关闭中集合。
@@ -2455,6 +2457,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         _ => {
+            // F1：系统在按键**按下**时就会为它发 `WM_HELP`，浮层没有任何帮助内容，
+            // `DefWindowProcW` 查不到就响一声系统默认提示音；这里直接吞掉。
+            if msg == WM_HELP {
+                return 0;
+            }
             // SAFETY: 默认窗口过程处理其余消息，参数均来自系统。
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
