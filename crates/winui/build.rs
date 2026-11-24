@@ -6,14 +6,14 @@
 //! **gnu 目标**（`x86_64-pc-windows-gnu` 等）用 mingw 的 `windres`：在 `OUT_DIR` 写一个
 //! 只含两行的 `.rc`（`#include "app.rc"` + 清单那一行），工作目录切到 `assets/` 后编成
 //! COFF 目标文件 `$OUT_DIR/app.res.o`，再 `cargo:rustc-link-arg-bins` 交给最终链接；
-//! **msvc 目标**用 `rc.exe`（退到 `llvm-rc`）把 `assets/app.rc` 编成 `$OUT_DIR/app.res`，
-//! `link.exe` 直接吃 `.res`，同样走 `cargo:rustc-link-arg-bins`。
+//! **msvc 目标**用 `rc.exe`（退到 `llvm-rc`）把同一份合成 `.rc` 编成 `$OUT_DIR/app.res`，
+//! `link.exe` 直接吃 `.res`（rc.exe 只能产 `.res`，不能产 COFF），同样走
+//! `cargo:rustc-link-arg-bins`。
 //!
 //! 为什么要合成一个 `.rc`：PE 的资源表只能有一棵目录树。清单与图标如果分别编成两个目标
 //! 文件，链接后是两段同名 `.rsrc`，第二段的目录节点没有任何东西指过去——图标会静默丢失。
-//! 所以 gnu 分支只喂一次 windres，让「资源 1 / 类型 24 / 清单」与「资源 1 / 类型 3 /
-//! 图标」落在同一段 `.rsrc` 里。（清单本来就只在 gnu 分支嵌入，msvc 分支维持原状，
-//! 只嵌图标。）
+//! 所以两个分支都只喂一次资源编译器，让「资源 1 / 类型 24 / 清单」与「资源 1 / 类型 3 /
+//! 图标」落在同一段 `.rsrc` 里。
 //!
 //! 找不到 windres / rc.exe，或编译失败时只打 `cargo:warning`，绝不 panic：Linux 上的
 //! `cargo check` / `cargo test` 依赖这一点。图标嵌进去之后 exe 才有 `.rsrc` 资源节，
@@ -113,9 +113,11 @@ fn embed_gnu() {
 }
 
 /// 参数：无（读 `CARGO_MANIFEST_DIR` / `OUT_DIR`）
-/// 核心流程：`rc /nologo /fo $OUT_DIR/app.res app.rc`（`llvm-rc` 不认 `/nologo`，单独分支），
-/// 工作目录切到 `assets/` 保证 `"app.ico"` 找得到；候选按 `$RC` → `$WINDRES` → `rc.exe` →
-/// `llvm-rc` 顺序试，第一个成功就用。全部失败只打 warning。
+/// 核心流程：与 `embed_gnu` 同构——在 `OUT_DIR` 写合成 `.rc`（图标 + 清单一行，`rc.exe` 用
+/// `#include "app.rc"` 版、`llvm-rc` 用内容等价的 `#include`-free 版），工作目录切到
+/// `assets/`，用 `rc.exe`（`llvm-rc` 退路，且不认 `/nologo`）加 `/I .` 编成
+/// `$OUT_DIR/app.res`（rc.exe 只能产 `.res`，`link.exe` 直接吃它）；候选按 `$RC` → `$WINDRES`
+/// → `rc.exe` → `llvm-rc` 顺序试，第一个成功就用。全部失败只打 warning。
 fn embed_icon_msvc() {
     let Some((manifest_dir, out_dir)) = dirs() else {
         return;
@@ -123,16 +125,52 @@ fn embed_icon_msvc() {
     let assets_dir = manifest_dir.join("assets");
     if !assets_dir.join("app.rc").is_file() {
         println!(
-            "cargo:warning=缺少 {}/app.rc，跳过图标嵌入",
+            "cargo:warning=缺少 {}/app.rc，跳过图标与清单嵌入",
             assets_dir.display()
         );
+        return;
+    }
+
+    // 合成 .rc 的内容与 gnu 分支一致：`#include "app.rc"`（`1 ICON "app.ico"`）再补清单一行。
+    // 清单路径用相对工作目录（assets/）的形式而不是绝对路径：rc.exe 与 llvm-rc 都按工作
+    // 目录解析资源文件（`.rc` 里的 `"app.ico"` 同理），而 llvm-rc 会把以 `/` 开头的 POSIX
+    // 绝对路径当成 Windows「当前盘符」路径，直接报 file not found。`..` 的上一层就是
+    // `CARGO_MANIFEST_DIR`，指向的还是同一份清单。
+    //
+    // 为什么要写两份：`llvm-rc` 会**静默**吞掉 `#include`（实测 LLVM 7 时代那版编出来的
+    // `.res` 只有清单、没有图标），所以额外给它一份把 `app.rc` 文本内联进来的等价文件。
+    let manifest_entry = "1 24 \"../switcheroo-win.manifest\"\n";
+    let include_rc = out_dir.join("switcheroo-win-res.rc");
+    if let Err(err) = std::fs::write(
+        &include_rc,
+        format!("#include \"app.rc\"\n{manifest_entry}"),
+    ) {
+        println!("cargo:warning=写入合成 .rc 失败，跳过图标与清单嵌入：{err}");
+        return;
+    }
+    let inline_rc = out_dir.join("switcheroo-win-res-inline.rc");
+    let inlined = match std::fs::read_to_string(assets_dir.join("app.rc")) {
+        Ok(text) => format!("{text}\n{manifest_entry}"),
+        Err(err) => {
+            println!("cargo:warning=读取 app.rc 失败，跳过图标与清单嵌入：{err}");
+            return;
+        }
+    };
+    if let Err(err) = std::fs::write(&inline_rc, inlined) {
+        println!("cargo:warning=写入合成 .rc 失败，跳过图标与清单嵌入：{err}");
         return;
     }
 
     let res_path = out_dir.join("app.res");
     let mut last_error = String::from("没有可用的 rc.exe / llvm-rc");
     for program in msvc_resource_compilers() {
-        match compile_msvc(&program, &assets_dir, &res_path) {
+        // llvm-rc 用内联版（它不认 #include），rc.exe 用标准版。
+        let rc_path = if is_llvm_rc(&program) {
+            &inline_rc
+        } else {
+            &include_rc
+        };
+        match compile_msvc(&program, &assets_dir, rc_path, &res_path) {
             Ok(()) => {
                 // `.res` 没有符号，link.exe 直接当输入接受；重复链接对 bin/test 无副作用。
                 println!("cargo:rustc-link-arg-bins={}", res_path.display());
@@ -142,7 +180,7 @@ fn embed_icon_msvc() {
         }
     }
     println!(
-        "cargo:warning=msvc 图标资源嵌入失败，已跳过（exe 将使用默认图标）；\
+        "cargo:warning=msvc 图标与清单嵌入失败，已跳过（exe 将用默认图标、没有 requireAdministrator 清单）；\
          可设置 RC 或 WINDRES 指向 rc.exe：{last_error}"
     );
 }
@@ -208,25 +246,42 @@ fn msvc_resource_compilers() -> Vec<String> {
     candidates
 }
 
-/// 参数：`program` 资源编译器；`assets_dir` 放着 `app.rc` 与 `app.ico`；`res_path` 要写出的
-/// `.res`
-/// 核心流程：工作目录切到 `assets/`（`"app.ico"` 是相对路径）→ `rc.exe` 加 `/nologo`
-/// （`llvm-rc` 不认）→ `/fo <out.res> app.rc` 编译 → 校验 `.res` 落地。失败返回原因字符串。
-fn compile_msvc(program: &str, assets_dir: &Path, res_path: &Path) -> Result<(), String> {
-    let is_llvm_rc = program.to_ascii_lowercase().contains("llvm-rc");
+/// 参数：`program` 候选资源编译器
+/// 核心流程：名字里带 `llvm-rc` 就认定是 LLVM 那版（不认 `/nologo`、还会静默吞掉 `#include`），
+/// 参数拼法与合成 `.rc` 的版本都据此分叉。
+fn is_llvm_rc(program: &str) -> bool {
+    program.to_ascii_lowercase().contains("llvm-rc")
+}
+
+/// 参数：`program` 资源编译器；`assets_dir` 放着 `app.ico`，同时作为工作目录；`rc_path` 是
+/// `OUT_DIR` 里合成的 `.rc`；`res_path` 要写出的 `.res`
+/// 核心流程：工作目录切到 `assets/`（`"app.ico"` 是相对路径）→ `/I .` 让预处理器能
+/// `#include "app.rc"`（对应 gnu 分支的 `-I .`）→ `rc.exe` 加 `/nologo`（`llvm-rc` 不认）
+/// → `/fo <out.res> <rc>` 编译 → 校验 `.res` 落地。失败返回原因字符串。
+fn compile_msvc(
+    program: &str,
+    assets_dir: &Path,
+    rc_path: &Path,
+    res_path: &Path,
+) -> Result<(), String> {
     let mut command = Command::new(program);
     command.current_dir(assets_dir);
-    if !is_llvm_rc {
+    if !is_llvm_rc(program) {
         command.arg("/nologo");
     }
-    command.arg("/fo").arg(res_path).arg("app.rc");
+    command
+        .arg("/I")
+        .arg(".")
+        .arg("/fo")
+        .arg(res_path)
+        .arg(rc_path);
 
     let output = command
         .output()
         .map_err(|err| format!("无法执行 {program}：{err}"))?;
     if !output.status.success() {
         return Err(format!(
-            "{program} 编译 app.rc 失败（{}）：{}",
+            "{program} 编译合成 .rc 失败（{}）：{}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ));

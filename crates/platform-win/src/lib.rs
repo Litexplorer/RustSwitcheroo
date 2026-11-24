@@ -21,7 +21,7 @@ pub mod system_theme;
 pub mod tray;
 pub mod win32_parse;
 
-pub use autostart::{disable, enable, is_enabled};
+pub use autostart::{disable, enable, is_enabled, migrate_legacy_run_value};
 pub use close::{is_window_alive, request_close};
 pub use foreground::{foreground_window, ForegroundWindow};
 pub use hotkey::{HotkeyError, HotkeyListener, HotkeySpec};

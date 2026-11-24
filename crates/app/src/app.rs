@@ -30,6 +30,7 @@ use switcheroo_core::{
     HotkeySetting, RankedWindow, Selection, Settings, ThemeSetting, WindowId, WindowInfo, MOD_ALT,
     MOD_CONTROL, MOD_SHIFT, MOD_WIN,
 };
+use switcheroo_platform_win::close::CloseOutcome;
 use switcheroo_platform_win::{
     disable, enable, foreground_window, is_enabled, is_system_dark, is_window_alive, request_close,
     snapshot, switch_to, HotkeyListener, HotkeySpec, SingleInstance, SingleInstanceError, Tray,
@@ -1397,7 +1398,13 @@ impl SwitcherooApp {
         // 成功路径顺手清掉上一次的红色提示，避免历史错误残留在界面上。
         self.switch_error = None;
 
-        if request_close(id) {
+        let outcome = request_close(id);
+        // UIPI 拒绝（目标以管理员权限运行）也是失败路径，但多说一句原因，便于用户自救。
+        if outcome == CloseOutcome::Denied {
+            log::warn!("关闭窗口被 UIPI 拒绝（目标以管理员权限运行）：「{title}」");
+        }
+
+        if outcome == CloseOutcome::Requested {
             log::info!("已请求关闭窗口「{title}」，每 {CLOSE_POLL_MS} ms 轮询确认");
             // 第一次轮询靠这里排程；后续每一次都由 `poll_closing` 自己续上。
             ctx.request_repaint_after(Duration::from_millis(CLOSE_POLL_MS));

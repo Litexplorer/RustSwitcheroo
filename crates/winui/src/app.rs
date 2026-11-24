@@ -15,9 +15,12 @@
 //! 点击、双击、悬停与滚轮在父窗口的 `WM_MOUSE*` 里按行矩形命中，与渲染共用
 //! `layout::ROW_HEIGHT` 与 `layout::list_top()`，画出来的行与点得到的行永远对得上。
 //!
-//! 关闭窗口（S8）：`Ctrl+W` / `Alt+X` 对选中窗口调 `request_close`，把 id 记进
-//! [`ClosingWindows`] 并用 `SetTimer(hwnd, id, 125ms, None)` 起一个窗口定时器；
-//! 每个 `WM_TIMER` 用 `is_window_alive` 复查一遍，确认消失的条目从快照与排名里一起移除。
+//! 关闭窗口（S8）：`Ctrl+W` / `Alt+X` 对选中窗口调 `request_close`，结果按 [`CloseOutcome`]
+//! 分三路：`Requested` 把 id 记进 [`ClosingWindows`] 并用 `SetTimer(hwnd, id, 125ms, None)`
+//! 起一个窗口定时器，每个 `WM_TIMER` 用 `is_window_alive` 复查一遍，确认消失的条目从快照与
+//! 排名里一起移除；`Denied` 是 UIPI 拒绝——目标窗口以管理员（更高完整性级别）运行时，
+//! `WM_CLOSE` 会被系统挡在目标进程之外，此时只提示「需要管理员权限才能关闭」，不登记关闭中
+//! 也不起轮询；要关掉这类窗口，本程序自身必须先提权（发布用的清单已是 `requireAdministrator`）。
 //! 全程在窗口线程上跑，没有额外线程。
 //!
 //! 失焦收起：`WM_ACTIVATE` 的低字为 `WA_INACTIVE`（光标点到别的窗口 / 程序被切到后台）时，
@@ -53,8 +56,9 @@ use switcheroo_core::{
     MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
 };
 use switcheroo_platform_win::{
-    autostart, is_system_dark, is_window_alive, request_close, switch_to, HotkeyError,
-    HotkeyListener, HotkeySpec, SingleInstance, SingleInstanceError, Tray, TrayCommand,
+    autostart, close::CloseOutcome, is_system_dark, is_window_alive, request_close, switch_to,
+    HotkeyError, HotkeyListener, HotkeySpec, SingleInstance, SingleInstanceError, Tray,
+    TrayCommand,
 };
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -202,9 +206,10 @@ struct App {
 
 impl App {
     /// 参数：`hwnd` 已创建但尚未显示的窗口句柄。
-    /// 核心流程：创建 Direct2D / DirectWrite 渲染器 → 读配置（自启状态以注册表为准，不一致时
-    /// 立刻回写一次）→ 按配置里的主题与系统明暗定下 `dark` → 用该套配色的搜索框底色建输入框
-    /// 背景刷 → 建命令通道并起托盘线程（勾选按对账后的注册表真值初始化；起不来只 `warn`）。
+    /// 核心流程：创建 Direct2D / DirectWrite 渲染器 → 读配置 → 把旧版写在 HKCU Run 下的自启值
+    /// 迁移到计划任务（失败只 `warn`，不拦启动）→ 自启状态以计划任务为准，不一致时立刻回写一次
+    /// → 按配置里的主题与系统明暗定下 `dark` → 用该套配色的搜索框底色建输入框背景刷 → 建命令
+    /// 通道并起托盘线程（勾选按对账后的自启真值初始化；起不来只 `warn`）。
     /// 任一步失败都只把原因记进 `error_text` / 日志，窗口仍可显示。
     fn new(hwnd: HWND) -> Self {
         let (renderer, error_text) = match Renderer::new() {
@@ -218,14 +223,25 @@ impl App {
             }
         };
 
-        // S10：开机自启以注册表为准。用户在任务管理器里关过自启、或换了 exe 路径，都以
-        // 注册表的真实状态修正配置并回写，面板打开时看到的勾选才是真的。
+        // S10：开机自启以计划任务为准。用户在任务管理器里关过自启、或换了 exe 路径，都以
+        // 计划任务的真实状态修正配置并回写，面板打开时看到的勾选才是真的。
         let mut settings = load_settings();
+        // 旧 egui 版把自启写在 HKCU Run 下，新版改用计划任务：先迁移再读真值，否则旧值会被当成
+        // 「已启用」而计划任务其实并不存在。迁移幂等、没有旧值时零副作用；失败只记 warn——
+        // 旧值仍在（自启不会凭空消失），不值得为它拦住启动。
+        if let Err(err) = autostart::migrate_legacy_run_value() {
+            log::warn!("开机自启迁移（HKCU Run → 计划任务）失败，保留旧值：{err}");
+        }
+        // 任务里可能还存着旧的 8.3 短路径（短名会重排、卷关掉 8.3 名称生成后直接失效）：比对
+        // 任务目标，不一致就用当前长路径覆盖一次；一致时零副作用，所以每次启动都能调。
+        if let Err(err) = autostart::reconcile_task_target() {
+            log::warn!("自启任务目标校正失败，保留原任务：{err}");
+        }
         let registered = autostart::is_enabled();
         if settings.autostart != registered {
             settings.autostart = registered;
             log::info!(
-                "开机自启以注册表为准修正为 {registered}，回写配置{}",
+                "开机自启以计划任务为准修正为 {registered}，回写配置{}",
                 match save_settings(&settings) {
                     Ok(()) => String::new(),
                     Err(err) => format!("失败：{err}"),
@@ -1347,9 +1363,11 @@ impl App {
     }
 
     /// 参数：无
-    /// 核心流程：选中窗口已经在关闭中就直接返回（不重复投递 `WM_CLOSE`）→ `request_close`
-    /// 成功则记进关闭中集合并起 125ms 轮询 → 失败时如果窗口还活着就把「关闭失败：<标题>」
-    /// 显示在卡片底部（浮层保持），窗口已经不存在则当场把它从列表里移除。
+    /// 核心流程：选中窗口已经在关闭中就直接返回（不重复投递 `WM_CLOSE`）→ `request_close` 的结果
+    /// 按 [`CloseOutcome`] 分三路：`Requested` 记进关闭中集合并起 125ms 轮询；`Denied`（UIPI 拒绝）
+    /// 只提示「需要管理员权限才能关闭：<标题>」，不登记、不轮询、也不移除该行——重试同样会被拒；
+    /// `Failed` 时如果窗口还活着就把「关闭失败：<标题>」显示在卡片底部（浮层保持），窗口已经不存在
+    /// 则当场把它从列表里移除。
     fn close_selected(&mut self) {
         let Some(row) = self.list.selected() else {
             log::debug!("关闭被忽略：列表为空，没有选中的窗口");
@@ -1366,38 +1384,51 @@ impl App {
             return;
         }
 
-        if request_close(id) {
-            self.closing.insert(id);
-            self.start_close_timer();
-            self.notice = None;
-            log::info!(
-                "已请求关闭窗口 {:#X}（{}），开启 {POLL_INTERVAL_MS}ms 轮询",
-                id.raw(),
-                title
-            );
-            self.render();
-            return;
-        }
-
-        // 投递失败：集合里本来就没有它，这里显式移除一次，保证不会残留「关闭中」标记。
-        self.closing.remove(id);
-        if is_window_alive(id) {
-            log::warn!("关闭窗口失败：{:#X}（{}），窗口仍存活", id.raw(), title);
-            self.notice = Some(format!("关闭失败：{title}"));
-            self.render();
-        } else {
-            log::info!(
-                "关闭窗口 {:#X} 的请求失败，但窗口已消失，直接移除",
-                id.raw()
-            );
-            self.list.remove_window(id);
-            self.sync_icons();
-            self.hover = None;
-            if self.list.is_empty() {
-                log::info!("列表已关空，隐藏浮层");
-                self.hide("列表已关空");
-            } else {
+        match request_close(id) {
+            CloseOutcome::Requested => {
+                self.closing.insert(id);
+                self.start_close_timer();
+                self.notice = None;
+                log::info!(
+                    "已请求关闭窗口 {:#X}（{}），开启 {POLL_INTERVAL_MS}ms 轮询",
+                    id.raw(),
+                    title
+                );
                 self.render();
+            }
+            CloseOutcome::Denied => {
+                // UIPI 拒绝：目标属于更高完整性级别的进程，再投递多少次都会被拦，所以既不影响
+                // 关闭中集合（上面已经确认它不在里面），也不移除该行——行留着，用户还能切过去。
+                log::warn!(
+                    "关闭窗口 {:#X}（{}）被 UIPI 拒绝：目标进程完整性级别更高，重试无意义",
+                    id.raw(),
+                    title
+                );
+                self.notice = Some(format!("需要管理员权限才能关闭：{title}"));
+                self.render();
+            }
+            CloseOutcome::Failed => {
+                // 投递失败：集合里本来就没有它，这里显式移除一次，保证不会残留「关闭中」标记。
+                self.closing.remove(id);
+                if is_window_alive(id) {
+                    log::warn!("关闭窗口失败：{:#X}（{}），窗口仍存活", id.raw(), title);
+                    self.notice = Some(format!("关闭失败：{title}"));
+                    self.render();
+                } else {
+                    log::info!(
+                        "关闭窗口 {:#X} 的请求失败，但窗口已消失，直接移除",
+                        id.raw()
+                    );
+                    self.list.remove_window(id);
+                    self.sync_icons();
+                    self.hover = None;
+                    if self.list.is_empty() {
+                        log::info!("列表已关空，隐藏浮层");
+                        self.hide("列表已关空");
+                    } else {
+                        self.render();
+                    }
+                }
             }
         }
     }

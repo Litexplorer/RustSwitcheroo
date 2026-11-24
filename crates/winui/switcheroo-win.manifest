@@ -5,7 +5,13 @@
   做两件事：
     1. 依赖 comctl32 v6（Common-Controls 6.0）：让原生控件（输入框）走 v6 的视觉样式。
        注意占位文案（S9）已经改成由渲染器自己画，不再依赖 v6 EDIT 的 `EM_SETCUEBANNER`。
-    2. 显式声明以调用者权限运行，避免系统用「安装包启发式」去猜是否需要提权。
+    2. 常驻提权：声明 `requireAdministrator`，进程一启动就拿到高完整性（high IL）令牌。
+
+  为什么必须常驻提权（而不是按需 asInvoker）：
+    本进程要「关闭管理员窗口」，实现方式是向目标窗口 `PostMessage(WM_CLOSE)`。
+    UIPI（User Interface Privilege Isolation）会拦截低完整性进程向高完整性窗口投递消息——
+    asInvoker 启动的中/低完整性进程根本发不出这条消息，且是静默失败。目标窗口可能是
+    管理员权限的，因此唯一可靠的做法是让自身也常驻在管理员权限下。
 
   注意：这里**不**声明 dpiAware / dpiAwareness，进程保持 DPI 不感知（虚拟化坐标），
   浮层的 DPI 换算（GetDpiForMonitor → scale）依赖这一点，改动前请一并调整 app.rs。
@@ -37,7 +43,7 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>

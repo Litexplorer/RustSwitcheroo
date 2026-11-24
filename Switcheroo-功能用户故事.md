@@ -698,6 +698,8 @@ Alt+Tab 钩子       ──> AltTabPressed        (MainWindow.xaml.cs:463)
 
 **小步产物：** 管理员权限下可切换到高权限窗口。
 
+> **现状（Rust 重写版）：** 「选项里开 Run as Administrator、启动时按需 `runas` 重新拉起」这个模型没有采用。原生浮层改为在 manifest 里常驻声明 `requireAdministrator`，启动即提权、不再有「非管理员运行」的分支，详见 EP-10 的 US-055。上列三条按可选开关 / 按需提权 / 非管理员降级来验收的口径对本版不再适用。
+
 #### US-050 Alt+Tab 接管
 **描述：** 作为高级用户，我希望 Alt+Tab 直接打开 Switcheroo，而不是系统任务切换器。
 **依赖：** US-039、US-046
@@ -804,6 +806,69 @@ Alt+Tab 钩子       ──> AltTabPressed        (MainWindow.xaml.cs:463)
 
 ---
 
+### EP-10 常驻提权与开机自启迁移
+
+> **背景：** 原生浮层（`crates/winui`）必须常驻管理员权限才能关掉高权限窗口，权限模型一变，
+> 原来的 HKCU Run 键自启就不再可用（Run 键拉起的进程拿不到提权）。本 EP 记录随之落地的三项
+> 改动：manifest 常驻提权、自启改计划任务、关闭失败原因可区分。
+> **与 EP-01 的关系：** EP-01 的 US-003（开机自启）、US-004（以管理员权限运行）描述的是原版
+> WPF 的「启动文件夹快捷方式 + 可选 runas」模型；两者冲突时以本 EP 描述的 Rust 重写版现状为准。
+
+#### US-055 常驻管理员权限
+**描述：** 作为需要关闭管理员窗口的用户，我希望 Switcheroo 自身就以管理员身份运行，这样向高完整性窗口投递的关闭请求才不会被系统拦下来。
+**依赖：** US-043、US-049
+**验收标准：**
+- [x] `crates/winui/switcheroo-win.manifest` 的 `requestedExecutionLevel` 为 `requireAdministrator`，进程启动即拿到高完整性（high IL）令牌
+- [x] 图标与 `RT_MANIFEST` 清单合进同一份 `.rc` 再编译（`crates/winui/build.rs` 的 `embed_gnu` 与 `embed_icon_msvc` 两个分支同样做法），避免分成两个资源目标文件后丢清单或丢图标
+- [x] 资源编译器缺失或编译失败时只打 `cargo:warning`、不让构建失败（Linux 上的 `cargo check` / `cargo test` 依赖这一点）
+- [ ] 真机：启动 `switcheroo-win.exe` 弹一次 UAC 确认，确认后能在浮层里关掉「以管理员身份运行」的窗口（待真机验证）
+- [ ] 构建日志出现「跳过图标与清单嵌入」警告时，能确认该 exe 没有提权清单、关不掉管理员窗口（待真机验证）
+**备注：**
+- 为什么必须常驻提权：实现关闭的方式是向目标窗口 `PostMessage(WM_CLOSE)`，而 UIPI 会拦截低完整性进程向高完整性窗口投递消息，且是静默失败——所以「按需 asInvoker」的方案不成立。
+- UAC：`requireAdministrator` 的 exe 每次启动都会弹一次确认（不是只在首次启动弹），这是常驻提权的直接代价。
+- 清单不声明 `dpiAware` / `dpiAwareness`，进程保持 DPI 不感知（虚拟化坐标），浮层的 DPI 换算依赖这一点。
+- 失败退路：清单没有嵌进 exe 时程序仍能启动，但关闭高权限窗口会落到 `CloseOutcome::Denied`。
+
+#### US-056 开机自启改用计划任务
+**描述：** 作为开了开机自启的用户，我希望登录后 Switcheroo 自己以管理员权限起来，且登录时不再被 UAC 拦一下；从旧版升级上来的用户，历史写在注册表 Run 键里的自启也要自动搬过来。
+**依赖：** US-055、US-048
+**验收标准：**
+- [x] 开启自启执行 `schtasks /create /tn Switcheroo /tr "<exe 全路径>" /sc onlogon /rl HIGHEST /f`（`crates/platform-win/src/autostart.rs` 的 `create_args`），不再写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+- [x] 状态判定用 `schtasks /query /tn Switcheroo` 的退出码（`is_enabled`；查询失败或退出码非 0 一律按未启用处理）
+- [x] 关闭自启用 `schtasks /delete /tn Switcheroo /f`（`disable`；任务本来就不存在也算成功，不报错）
+- [x] 调用 `schtasks.exe` 走 `CreateProcessW` + `CREATE_NO_WINDOW`（`run_quiet`），不弹窗、不闪黑框，并用全路径而不是裸名字
+- [x] 任务动作里的 exe 全路径总是加一对引号（`quote_exe_path`），路径含空格、中文或结尾反斜杠时不会被任务计划程序拆错
+- [x] （迁移）启动时调用 `autostart::migrate_legacy_run_value()`，把 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `Switcheroo` 旧值迁到计划任务
+- [x] （迁移）顺序是「先建计划任务、成功后才删旧值」（内部依次为查旧值 → `enable()` → `delete_legacy_run_value()`），中途失败时旧值还在，自启不会凭空消失
+- [x] （迁移）没有旧值时直接返回、零副作用，重复调用结果一致（幂等），因此每次启动都可以调
+- [x] （迁移）迁移失败只 `log::warn!` 并保留旧值、不拦启动；非 Windows 平台上 `migrate_legacy_run_value()` 恒 `Ok(())`
+- [ ] 真机：勾选自启 → 注销重登 → 托盘出现，且任务计划程序里能看到 `Switcheroo` 任务、触发器为「登录时」、以最高权限运行（待真机验证）
+- [ ] 真机：`enable` / `disable` 失败时把 schtasks 退出码写进 `Err`，界面回退勾选并给出提示（待真机验证）
+- [ ] 真机：（迁移）先手工写一条旧 Run 值再启动，确认计划任务被创建、旧值被删除、`is_enabled()` 为真（待真机验证）
+**备注：**
+- 计划任务名固定为 `Switcheroo`；`/f` 让重复开启幂等，不会因为「任务已存在」报错。
+- 为什么换掉 Run 键：manifest 要求管理员权限，Run 键拉起的进程拿不到提权，开机时会弹 UAC 或直接失效；`/rl HIGHEST` 的计划任务由任务计划程序以提权方式拉起，登录时不再弹 UAC。
+- 建 `/rl HIGHEST` 的任务本身要在已提权的进程里做——本程序常驻管理员权限，所以 `enable()` 不需要额外提权。
+- 状态以计划任务为准：启动时用 `is_enabled()` 的真值修正配置并回写，避免用户在任务管理器里改过之后界面还在谎报已启用。
+- 迁移的旧值名与任务名同为 `Switcheroo`，旧值由 egui 版写在 HKCU Run 下；迁移本身是幂等的，查不到旧值就直接返回，既不建任务也不碰注册表。
+- 迁移排在读自启真值之前，否则旧值会被当成「已启用」而计划任务其实并不存在。
+
+#### US-057 关闭失败原因可区分
+**描述：** 作为用户，我希望关窗口失败时能分清是「权限不够」还是「窗口本来就没了」，而不是只有一句笼统的失败。
+**依赖：** US-043
+**验收标准：**
+- [x] `request_close` 返回 `CloseOutcome::{Requested, Denied, Failed}`（`crates/platform-win/src/close.rs`），不再用裸 `bool`
+- [x] `GetLastError() == ERROR_ACCESS_DENIED(5)` 归为 `Denied`，0 与其它错误码一律归为 `Failed`（`outcome_from_error`，有跨平台单测）
+- [x] `Denied` 时浮层提示「需要管理员权限才能关闭：<标题>」，既不把该行标成关闭中，也不从列表移除（`crates/winui/src/app.rs` 的 `close_selected`）
+- [x] `Failed` 时若窗口仍存活提示「关闭失败：<标题>」并保留该行；窗口已经不在则当场从列表移除
+- [ ] 真机：对管理员权限的窗口按 `Ctrl+W` 能看到权限提示，对普通窗口能正常关掉（待真机验证）
+**备注：**
+- `Requested` 只表示 `WM_CLOSE` 已投递进目标窗口的消息队列，是否真的关掉由 `is_window_alive` 的 125ms 轮询确认，三种结果不混用。
+- 用 `GetLastError()` 取原始错误码，而不是 `windows` crate 折出来的 `HRESULT_FROM_WIN32(5)`（`0x80070005`），省掉反解编码细节。
+- 提示复用卡片底部那一行红字（`notice`），不弹模态框，浮层保持打开、条目保留，用户可以直接切过去。
+
+---
+
 ## 五、非功能需求
 
 | 编号 | 类别 | 要求 | 现状依据 |
@@ -811,7 +876,7 @@ Alt+Tab 钩子       ──> AltTabPressed        (MainWindow.xaml.cs:463)
 | NFR-1 | 平台 | 仅 Windows，依赖 WPF 与 Win32 API | `Switcheroo.csproj`、`Core/WinApi.cs` |
 | NFR-2 | 响应性 | 输入过滤需在交互延迟内完成；图标异步加载不阻塞列表 | `PriorityBinding`、`MemoryCache` |
 | NFR-3 | 稳定性 | 窗口关闭/图标读取等易失败路径不得导致崩溃 | `WindowIconFinder` try/catch、`WindowCloser` 轮询 |
-| NFR-4 | 权限 | 非管理员可运行，管理员模式为可选增强 | `Program.cs:75-90` |
+| NFR-4 | 权限 | 原版口径：非管理员可运行，管理员模式为可选增强；Rust 重写版改为常驻管理员权限（`requireAdministrator`），见 EP-10 的 US-055 | `Program.cs:75-90`、`crates/winui/switcheroo-win.manifest` |
 | NFR-5 | 兼容性 | 窗口口径需覆盖 Win7~Win10（含 UWP） | `Core/AppWindow.cs:122-228` |
 | NFR-6 | 可本地化 | 界面文案当前为英文硬编码 | `MainWindow.xaml`、`OptionsWindow.xaml` |
 
@@ -842,3 +907,4 @@ Alt+Tab 钩子       ──> AltTabPressed        (MainWindow.xaml.cs:463)
 | 选项、关于、更新检查 | US-027 ~ US-029 |
 | 单测、安装分发 | US-030 ~ US-031 |
 | egui 项目搭建与小步交付 | US-032 ~ US-054 |
+| 常驻提权、计划任务自启与旧值迁移、关闭失败区分 | US-055 ~ US-057 |
